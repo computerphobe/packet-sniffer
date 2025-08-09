@@ -1,96 +1,185 @@
 #!/usr/bin/env python3
 
 import argparse
-from scapy.all import sniff, IP, TCP, UDP, Raw
+import time
+import atexit
+from collections import defaultdict, Counter
+from scapy.all import sniff, IP, IPv6, TCP, UDP, ARP, DNS, Raw, PcapWriter
 
-def packet_callback(packet):
-    """
-    This function is called for each captured packet.
-    It dissects and prints information about the packet.
-    """
-    # Check if the packet has an IP layer
-    if IP in packet:
-        ip_src = packet[IP].src
-        ip_dst = packet[IP].dst
+# --- Global Variables for Statistics and Threat Detection ---
 
-        # Identify the protocol
-        if TCP in packet:
-            # If it's a TCP packet, print source and destination ports
-            tcp_sport = packet[TCP].sport
-            tcp_dport = packet[TCP].dport
-            print(f"[*] TCP Packet: {ip_src}:{tcp_sport} -> {ip_dst}:{tcp_dport}")
-            
-            # Attempt to decode and display the payload for common text protocols
-            check_for_payload(packet)
+# Statistics tracking
+stats = {
+    "packet_count": 0,
+    "protocols": Counter(),
+    "top_talkers": Counter()
+}
 
-        elif UDP in packet:
-            # If it's a UDP packet, print source and destination ports
-            udp_sport = packet[UDP].sport
-            udp_dport = packet[UDP].dport
-            print(f"[*] UDP Packet: {ip_src}:{udp_sport} -> {ip_dst}:{udp_dport}")
-            
-            # Attempt to decode and display the payload
-            check_for_payload(packet)
-            
-        else:
-            # If it's another IP protocol (like ICMP)
-            print(f"[*] Other IP Packet: {ip_src} -> {ip_dst} | Protocol: {packet[IP].proto}")
+# ARP table for spoof detection: {"ip": "mac"}
+arp_table = {}
 
+# Port scan detection: { "dst_ip": { "src_ip": [timestamps] } }
+syn_tracker = defaultdict(lambda: defaultdict(list))
+PORT_SCAN_THRESHOLD = 15  # Num of SYNs from one source
+PORT_SCAN_TIMEFRAME = 60  # Within this many seconds
 
-def check_for_payload(packet):
-    """
-    Checks for and prints the raw payload of a packet if it exists.
-    Specifically looks for unencrypted HTTP GET/POST requests.
-    """
-    if Raw in packet:
-        # The Raw layer contains the payload data
-        payload = packet[Raw].load
+def print_summary():
+    """Prints a summary of the captured traffic upon exit."""
+    print("\n--- Capture Summary ---")
+    print(f"Total Packets Captured: {stats['packet_count']}")
+    if not stats['protocols']:
+        print("No traffic was captured.")
+        return
         
-        # Try to decode the payload as UTF-8 text
-        try:
-            decoded_payload = payload.decode('utf-8', errors='ignore')
-            
-            # A simple check for common HTTP methods in the payload
-            http_methods = ["GET ", "POST ", "HTTP/1", "Host:"]
-            if any(method in decoded_payload for method in http_methods):
-                print("    [+] Found potential HTTP Traffic:")
-                # Print the first line of the payload for brevity
-                print(f"    {decoded_payload.splitlines()[0]}")
+    print("\nProtocol Distribution:")
+    for proto, count in stats['protocols'].most_common():
+        print(f"  {proto:<5}: {count} packets")
+        
+    print("\nTop 5 Talkers (Source IPs):")
+    for ip, count in stats['top_talkers'].most_common(5):
+        print(f"  {ip}: {count} packets")
+    print("-----------------------\n")
 
-        except Exception as e:
-            # If decoding fails, just note that there is a payload
-            print("    [+] Payload found, but could not decode as text.")
+def process_packet(packet):
+    """
+    The main callback function called by Scapy's sniff().
+    It dispatches the packet to the correct processing function and updates stats.
+    """
+    if 'pcap_writer' in globals():
+        pcap_writer.write(packet)
 
+    stats['packet_count'] += 1
+
+    if ARP in packet:
+        stats['protocols']['ARP'] += 1
+        process_arp_packet(packet)
+    elif IP in packet:
+        stats['top_talkers'][packet[IP].src] += 1
+        process_ip_packet(packet)
+    elif IPv6 in packet:
+        stats['top_talkers'][packet[IPv6].src] += 1
+        stats['protocols']['IPv6'] += 1
+        process_ipv6_packet(packet)
+
+def process_arp_packet(packet):
+    """Detects ARP spoofing attacks."""
+    if packet[ARP].op == 2:  # is-at (response)
+        ip_addr, mac_addr = packet[ARP].psrc, packet[ARP].hwsrc
+        if ip_addr in arp_table and arp_table[ip_addr] != mac_addr:
+            print(f"\n[!] ALERT: Potential ARP Spoofing Detected!")
+            print(f"    IP: {ip_addr} changed MAC from {arp_table[ip_addr]} to {mac_addr}\n")
+        arp_table[ip_addr] = mac_addr
+
+def process_ip_packet(packet):
+    """Processes IPv4 packets."""
+    if TCP in packet:
+        stats['protocols']['TCP'] += 1
+        process_tcp_packet(packet)
+    elif UDP in packet:
+        stats['protocols']['UDP'] += 1
+        process_udp_packet(packet)
+    else:
+        stats['protocols']['Other_IP'] += 1
+
+def process_tcp_packet(packet):
+    """Processes TCP packets, including payload and port scan detection."""
+    ip_src, ip_dst = packet[IP].src, packet[IP].dst
+    tcp_sport, tcp_dport = packet[TCP].sport, packet[TCP].dport
+    flags = packet[TCP].flags
+    
+    print(f"[*] TCP: {ip_src}:{tcp_sport} -> {ip_dst}:{tcp_dport} | Flags: {flags}")
+
+    # OS Fingerprinting
+    ttl = packet[IP].ttl
+    if ttl <= 64: os_guess = "Linux/Unix"
+    elif ttl <= 128: os_guess = "Windows"
+    else: os_guess = "Router/Other"
+    print(f"    [i] TTL: {ttl} (Potential OS: {os_guess})")
+
+    # Port Scan Detection
+    if flags == 'S':
+        current_time = time.time()
+        tracker = syn_tracker[ip_dst][ip_src]
+        tracker.append(current_time)
+        tracker = [t for t in tracker if current_time - t < PORT_SCAN_TIMEFRAME]
+        syn_tracker[ip_dst][ip_src] = tracker
+        if len(tracker) >= PORT_SCAN_THRESHOLD:
+            print(f"\n[!] ALERT: Potential Port Scan Detected from {ip_src} to {ip_dst}\n")
+            syn_tracker[ip_dst][ip_src] = []
+
+    # HTTP Payload check
+    if Raw in packet:
+        check_for_http_payload(packet)
+
+def process_udp_packet(packet):
+    """Processes UDP packets, dispatching to DNS parser if applicable."""
+    ip_src, ip_dst = packet[IP].src, packet[IP].dst
+    udp_sport, udp_dport = packet[UDP].sport, packet[UDP].dport
+
+    # **THE FIX IS HERE**: Check for DNS inside the UDP block
+    if DNS in packet and (udp_sport == 53 or udp_dport == 53):
+        stats['protocols']['DNS'] += 1
+        process_dns_packet(packet)
+    else:
+        print(f"[*] UDP: {ip_src}:{udp_sport} -> {ip_dst}:{udp_dport}")
+
+def process_dns_packet(packet):
+    """Parses and displays DNS query and response details."""
+    try:
+        # DNS Query (qr=0)
+        if packet[DNS].qr == 0 and packet[DNS].qd:
+            query_name = packet[DNS].qd.qname.decode()
+            print(f"[+] DNS Query: {packet[IP].src} requested {query_name}")
+        # DNS Response (qr=1)
+        elif packet[DNS].qr == 1 and packet[DNS].an:
+            query_name = packet[DNS].qd.qname.decode()
+            answers = [r.rdata for r in packet[DNS].an if hasattr(r, 'rdata')]
+            ip_answers = [ans.decode() if isinstance(ans, bytes) else ans for ans in answers]
+            print(f"[+] DNS Response: {query_name} -> {ip_answers}")
+    except Exception as e:
+        print(f"    [!] Error parsing DNS packet: {e}")
+
+def process_ipv6_packet(packet):
+    """Basic processing for IPv6 packets."""
+    print(f"[*] IPv6: {packet[IPv6].src} -> {packet[IPv6].dst}")
+
+def check_for_http_payload(packet):
+    """Checks for and prints potential HTTP payloads."""
+    try:
+        payload = packet[Raw].load.decode('utf-8', errors='ignore')
+        http_methods = ["GET ", "POST ", "HTTP/1", "Host:"]
+        if any(method in payload for method in http_methods):
+            print(f"    [+] HTTP Payload: {payload.splitlines()[0]}")
+    except:
+        pass
 
 def main():
-    """
-    Main function to parse arguments and start the sniffer.
-    """
-    # Setup command-line argument parser
-    parser = argparse.ArgumentParser(description="A simple network packet sniffer.")
-    parser.add_argument("-i", "--interface", type=str, help="Network interface to sniff on (e.g., eth0, wlan0).")
-    parser.add_argument("-f", "--filter", type=str, help="BPF filter for sniffing (e.g., 'tcp port 80').")
+    """Main function to parse arguments and start the sniffer."""
+    parser = argparse.ArgumentParser(description="An enhanced network packet sniffer with threat detection.")
+    parser.add_argument("-i", "--interface", type=str, help="Network interface to sniff on.")
+    parser.add_argument("-f", "--filter", type=str, default=None, help="BPF filter (e.g., 'tcp port 80').")
+    parser.add_argument("-o", "--output", type=str, help="Output file to save packets (.pcap).")
     
     args = parser.parse_args()
 
-    print("--- Starting Packet Sniffer ---")
-    if args.interface:
-        print(f"[*] Sniffing on interface: {args.interface}")
-    if args.filter:
-        print(f"[*] Applying BPF filter: {args.filter}")
-    print("-------------------------------")
+    # Register the summary function to run on exit
+    atexit.register(print_summary)
 
-    # Start the sniffer
-    # 'prn' specifies the callback function for each packet
-    # 'store=0' tells Scapy not to keep packets in memory, saving resources
-    # 'iface' and 'filter' are set from the command line arguments
+    if args.output:
+        global pcap_writer
+        pcap_writer = PcapWriter(args.output, append=True, sync=True)
+
+    print("--- Starting Enhanced Packet Sniffer ---")
+    print("Press Ctrl+C to stop.")
+    
     try:
-        sniff(iface=args.interface, filter=args.filter, prn=packet_callback, store=0)
+        sniff(iface=args.interface, filter=args.filter, prn=process_packet, store=0)
     except Exception as e:
         print(f"\n[!] An error occurred: {e}")
-        print("[!] Make sure you are running this script with root/administrator privileges.")
-        print("[!] On Windows, ensure Npcap is installed correctly.")
-
+    finally:
+        if 'pcap_writer' in globals():
+            pcap_writer.close()
+            print(f"[*] Packets saved to {args.output}")
 
 if __name__ == "__main__":
     main()
