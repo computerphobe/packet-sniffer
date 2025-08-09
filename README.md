@@ -15,6 +15,10 @@ A powerful, command-line packet sniffer built with Python and Scapy. This tool a
 * **👁️ Port Scan Detection:** Detects and flags rapid `TCP SYN` requests from a single source to a single destination.
 * **Powerful Filtering:** Uses BPF (Berkeley Packet Filter) syntax to capture only the traffic you care about.
 * **Command-Line Interface:** Easy-to-use flags for specifying interfaces, filters, and output files.
+* **DNS Packet Capturing:** Capture DNS packets
+* **ARP Spoofing Detection:** Detect any ARP spoofing 
+* **Port Scan Detection:** Detect what ports are been scanned by whom. Trace the source IP
+
 
 ---
 
